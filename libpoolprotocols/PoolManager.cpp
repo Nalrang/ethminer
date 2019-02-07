@@ -12,7 +12,8 @@ PoolManager::PoolManager(PoolSettings _settings)
   : m_Settings(std::move(_settings)),
     m_io_strand(g_io_service),
     m_failovertimer(g_io_service),
-    m_submithrtimer(g_io_service)
+    m_submithrtimer(g_io_service),
+    m_reconnecttimer(g_io_service)
 {
     DEV_BUILD_LOG_PROGRAMFLOW(cnote, "PoolManager::PoolManager() begin");
 
@@ -71,7 +72,8 @@ void PoolManager::setClientHandlers()
             }
 
             cnote << "Established connection to " << m_selectedHost;
-
+            m_connectionAttempt = 0;
+          
             // Reset current WorkPackage
             m_currentWp.job.clear();
             m_currentWp.header = h256();
@@ -243,6 +245,7 @@ void PoolManager::stop()
             // Stop timing actors
             m_failovertimer.cancel();
             m_submithrtimer.cancel();
+            m_reconnecttimer.cancel();
 
             if (Farm::f().isMining())
             {
@@ -415,7 +418,9 @@ void PoolManager::rotateConnect()
     if (!m_Settings.connections.empty() && m_Settings.connections.at(m_activeConnectionIdx)->Host() != "exit")
     {
         if (p_client)
+        {
             p_client = nullptr;
+        }
 
         if (m_Settings.connections.at(m_activeConnectionIdx)->Family() == ProtocolFamily::GETWORK)
             p_client =
@@ -437,8 +442,19 @@ void PoolManager::rotateConnect()
                          to_string(m_Settings.connections.at(m_activeConnectionIdx)->Port());
         p_client->setConnection(m_Settings.connections.at(m_activeConnectionIdx));
         cnote << "Selected pool " << m_selectedHost;
-
-        p_client->connect();
+        
+        if ((m_connectionAttempt > 1) && (m_Settings.delayBeforeRetry > 0))
+        {
+            // sleep before retry 
+            cnote << "Connect attempt " << m_connectionAttempt << ", sleep "<< m_Settings.delayBeforeRetry << "s before re-connect";
+            m_reconnecttimer.expires_from_now(boost::posix_time::seconds(m_Settings.delayBeforeRetry));
+            m_reconnecttimer.async_wait(m_io_strand.wrap(boost::bind(
+                &PoolManager::reconnecttimer_elapsed, this, boost::asio::placeholders::error)));
+        }
+        else
+        {
+            p_client->connect();
+        }
     }
     else
     {
@@ -507,6 +523,20 @@ void PoolManager::submithrtimer_elapsed(const boost::system::error_code& ec)
     }
 }
 
+void PoolManager::reconnecttimer_elapsed(const boost::system::error_code& ec)
+{
+    if (!ec)
+    {
+        if (m_running.load(std::memory_order_relaxed))
+        {
+            if (p_client && !p_client->isConnected())
+            {
+                p_client->connect();
+            }
+        }
+    }
+}
+      
 int PoolManager::getCurrentEpoch()
 {
     return m_currentWp.epoch;
